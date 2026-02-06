@@ -1,0 +1,9 @@
+# Secrets
+.env.yaml
+
+# Python
+__pycache__/
+*.pyc
+
+# Backups
+*.bak

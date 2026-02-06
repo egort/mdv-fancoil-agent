@@ -1,0 +1,289 @@
+# =============================================================================
+# MDV/Midea Fancoil XYE Protocol Schema
+# =============================================================================
+# Based on: https://codeberg.org/xye/xye (xye.md)
+# Adapted for: MDV MKG-300C (FE-preamble variant)
+#
+# Key differences from vanilla XYE (verified on MKG-300C 2025-02):
+#   - Extra 0xFE byte before 0xAA preamble (all frames)
+#   - TX frame: 17 bytes (FE + 16 from XYE spec)
+#   - RX frame: 32 bytes (FE + 31 data + CRC, NO trailing 0x55)
+#   - AUTO mode = 0x11 (xye.md says 0x10) → full byte ON = 0x91
+#   - Fan byte is composite: bit7=user-selected-AUTO, bit2=mode-dep status
+#     MKG-300C reports only AUTO(0x80) vs Manual(0x00) — no L/M/H in status
+#   - AUTO mode forces AUTO fan (R51 manual), but bit7 is NOT set in status
+#     → bit7 means "user explicitly chose AUTO", not "fan is auto-controlled"
+#   - T1/T2A temperature sensors confirmed working: (raw-48)*0.5 °C
+#   - Temperature setpoint range: 17–30°C (R51 manual); FAN mode = 0xFF
+#   - Heat Pump model (HEAT mode available, R51 manual: "HEAT only for Heat Pump")
+#
+# CRC formula (verified against 4 known-good packets + live device):
+#   CRC = 255 - (sum(frame[1 .. crc_pos-1]) + 0x55) % 256
+#
+# SET commands fully verified (2025-02):
+#   - Mode change (HEAT/COOL/FAN): accepted, confirmed via query
+#   - Fan speed (AUTO/HIGH/MED/LOW): accepted, 1-beep acknowledgement
+#   - Temperature setpoint: accepted, display updates
+#   - SET response contains PREVIOUS state, NOT the new one
+#   - Need a follow-up QUERY to read back the applied values
+#
+# SW1 button on display PCB: service diagnostic mode, cycles through
+# internal parameters (setpoint, sensors, errors). "--" = 0xFF = N/A.
+# =============================================================================
+
+serial:
+  port: COM10
+  baud: 4800
+  bytesize: 8
+  parity: "N"
+  stopbits: 1
+  address: 0x00            # master address on the bus (0x00..0x3F)
+  poll_interval: 1.0       # seconds between automatic status polls
+  read_timeout: 0.5        # seconds to wait for response
+  inter_command_delay: 0.1  # seconds between TX and next TX
+
+# =============================================================================
+# TX Frame Layout (17 bytes)
+# =============================================================================
+# All TX frames share this structure:
+#
+#  Index:  0    1    2    3    4    5    6    7..13          14        15   16
+#          FE   AA   CMD  DST  00   80   SRC  payload(7b)   CMD_CHK   CRC  55
+#
+# CMD_CHK = 255 - CMD
+# CRC     = 255 - (sum(frame[1..14]) + 0x55) % 256
+# =============================================================================
+
+tx:
+  frame_length: 17
+  preamble: [0xFE, 0xAA]
+  epilogue: 0x55
+
+  # Byte offsets (0-based, within the 17-byte frame including FE)
+  offsets:
+    command: 2
+    destination: 3
+    zero_byte: 4           # always 0x00
+    from_master: 5         # always 0x80
+    source_id: 6           # master's own address (same as serial.address)
+    payload_start: 7       # bytes 7..13 = 7 payload bytes
+    payload_end: 13        # inclusive
+    command_check: 14      # 255 - command
+    crc: 15
+    epilogue: 16           # 0x55
+
+  # --- Query (GET status) ---
+  # Command 0xC0, payload = 7 × 0x00
+  query:
+    command: 0xC0
+    command_check: 0x3F    # 255 - 0xC0
+    template: [0xFE, 0xAA, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0x55]
+
+  # --- Set (control) --- ✓ VERIFIED on MKG-300C (2025-02)
+  # Command 0xC3, payload has mode/fan/temp/flags/timers
+  # Response echoes PREVIOUS state; query needed to read back new values.
+  set:
+    command: 0xC3
+    command_check: 0x3C    # 255 - 0xC3
+    template: [0xFE, 0xAA, 0xC3, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x55]
+    # SET payload byte offsets:
+    payload:
+      mode: 7              # Oper Mode byte
+      fan: 8               # Fan speed byte
+      temp: 9              # Temperature setpoint °C (0xFF in FAN mode)
+      mode_flags: 10       # ECO / Turbo / SWING / VENT
+      timer_start: 11      # Timer ON  (bit-encoded)
+      timer_stop: 12       # Timer OFF (bit-encoded)
+      reserved: 13         # always 0x00
+
+  # --- Lock --- ✓ VERIFIED: oper_flags shows LOCKED=0x80 immediately
+  lock:
+    command: 0xCC
+    command_check: 0x33
+    template: [0xFE, 0xAA, 0xCC, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00, 0x55]
+
+  # --- Unlock --- ✓ VERIFIED: oper_flags clears LOCKED=0x80 immediately
+  unlock:
+    command: 0xCD
+    command_check: 0x32
+    template: [0xFE, 0xAA, 0xCD, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x55]
+
+# =============================================================================
+# RX Frame Layout (32 bytes, no trailing 0x55)
+# =============================================================================
+# Observed on MKG-300C: response is 32 bytes, ends with CRC.
+# xye.md offsets +1 because of 0xFE prefix.
+# =============================================================================
+
+rx:
+  frame_length: 32
+  has_epilogue: false      # MKG-300C does NOT send trailing 0x55 in response
+
+  # Offsets: xye.md byte number + 1 (for the FE prefix)
+  offsets:
+    preamble_fe: 0         # 0xFE
+    preamble_aa: 1         # 0xAA (xye 0x00)
+    response_code: 2       # xye 0x01 — echoes command: 0xC0/0xC3/0xCC/0xCD
+    to_master: 3           # xye 0x02 — 0x80
+    destination: 4         # xye 0x03 — master's address
+    source: 5              # xye 0x04 — device's own address (the fancoil)
+    destination2: 6        # xye 0x05 — master address (repeated)
+    unknown_06: 7          # xye 0x06 — 0x30? maybe capabilities group
+    capabilities: 8        # xye 0x07 — MKG-300C always 0x14 (xye: 0x80=ext temp, 0x10=SWING)
+    mode: 9                # xye 0x08 — Oper Mode ✓ verified
+    fan: 10                # xye 0x09 — Fan speed (see notes in fields.fan)
+    setpoint: 11           # xye 0x0A — Set temperature °C ✓ verified
+    t1: 12                 # xye 0x0B — T1 sensor: (raw-48)*0.5 °C ✓ verified
+    t2a: 13                # xye 0x0C — T2A sensor: (raw-48)*0.5 °C ✓ verified
+    t2b: 14                # xye 0x0D — T2B sensor (may be 0xFF = invalid)
+    t3: 15                 # xye 0x0E — T3 sensor (may be 0xFF = invalid)
+    current: 16            # xye 0x0F — Current 0-99A (may be 0xFF = invalid)
+    unknown_10: 17         # xye 0x10 — 0xFF, could be frequency
+    # !! MKG-300C LAYOUT DIFFERS FROM xye.md for bytes 18-21 !!
+    # xye.md says: 0x11=timer_start, 0x12=timer_stop, 0x13=??, 0x14=mode_flags
+    # MKG-300C:   0x11=mode_flags,  0x12=??(timer?),  0x13=??, 0x14=??(always 0)
+    # Proven by: ECO→byte18=0x01, SWING→byte18=0x04, byte21 always 0x00
+    mode_flags: 18         # MKG-300C: mode_flags HERE (xye says timer_start!)
+    timer_start: 19        # xye 0x12 — possibly timer, needs timer test
+    unknown_13: 20         # xye 0x13 — 0x08 in non-HEAT modes, 0x00 in HEAT
+    unknown_14: 21         # xye 0x14 — always 0x00 on MKG-300C (xye says mode_flags)
+    oper_flags: 22         # xye 0x15 — 0x04=water pump, 0x80=locked ✓ verified
+    error_high: 23         # xye 0x16 — Error bits E0-E7
+    error_low: 24          # xye 0x17 — Error bits E8-EF
+    protect_high: 25       # xye 0x18 — Protection bits P0-P7
+    protect_low: 26        # xye 0x19 — Protection bits P8-PF
+    ccm_error: 27          # xye 0x1A — CCM communication error 0x00-0x02
+    unknown_1b: 28         # xye 0x1B — 0x00
+    unknown_1c: 29         # xye 0x1C — 0x00
+    unknown_1d: 30         # ?
+    crc: 31                # CRC (last byte)
+
+  # Temperature sensor conversion
+  temp_sensor:
+    formula: "(raw - 48) * 0.5"
+    offset: 48
+    scale: 0.5
+    invalid: 0xFF
+
+  # Setpoint limits (from R51 remote controller manual)
+  temp_limits:
+    min: 17
+    max: 30
+    fan_mode_value: 0xFF    # FAN mode does not control temperature
+
+# =============================================================================
+# CRC
+# =============================================================================
+
+crc:
+  start_offset: 1          # sum starts from index 1 (AA)
+  addend: 0x55             # 85 decimal — added to sum before complement
+  formula: "255 - (sum(frame[1:crc_pos]) + 0x55) % 256"
+
+# =============================================================================
+# Field Definitions
+# =============================================================================
+
+fields:
+  # Modes are mutually exclusive values (NOT a bitmask).
+  # Bit 7 (0x80) = Power ON flag; bits 0-4 = mode selection.
+  # To build mode byte: mode_value | 0x80 for ON, or 0x00 for OFF.
+  modes:
+    "OFF":  0x00
+    FAN:    0x01           # ON → 0x81  ✓ verified
+    DRY:    0x02           # ON → 0x82  ✓ verified
+    HEAT:   0x04           # ON → 0x84  ✓ verified
+    COOL:   0x08           # ON → 0x88  ✓ verified
+    AUTO:   0x11           # ON → 0x91  ✓ verified (xye.md says 0x10 → 0x80, MKG-300C = 0x11)
+
+  # ---------------------------------------------------------------------------
+  # Fan byte (RX offset 10, TX SET offset 8)
+  # ---------------------------------------------------------------------------
+  # The fan byte is NOT a simple fan-speed selector.  It is a COMPOSITE byte:
+  #
+  #   bit 7 (0x80) — Fan-Auto flag:   1 = AUTO speed,  0 = manual
+  #   bit 2 (0x04) — Status bit:      seems mode-dependent, NOT fan-speed
+  #   bits 0-1     — Fan speed value:  always 0 on MKG-300C status reports
+  #
+  # Live observations (MKG-300C, 2025-02):
+  #
+  #   Mode      Pult Fan  byte  bit7 bit2 bits0-1  Interpretation
+  #   ────────  ────────  ────  ──── ──── ───────  ──────────────────
+  #   HEAT      AUTO      0x80   1    0    0       AUTO fan in HEAT
+  #   HEAT      LOW       0x00   0    0    0       manual (speed unknown)
+  #   HEAT      MED       0x00   0    0    0       manual (speed unknown)
+  #   HEAT      HIGH      0x00   0    0    0       manual (speed unknown)
+  #   FAN       (last)    0x84   1    1    0       AUTO + status bit
+  #   COOL      (last)    0x84   1    1    0       AUTO + status bit
+  #   AUTO      (last)    0x04   0    1    0       manual + status bit
+  #   DRY       (last)    0x04   0    1    0       manual + status bit
+  #
+  # ► bit 2 pattern: set in FAN/COOL/AUTO/DRY, clear in HEAT.
+  #   Hypothesis: "fan is actively blowing" or "non-heating mode" indicator.
+  # ► LOW/MED/HIGH are NOT distinguished in status response (all = 0x00).
+  #   The xye.md SET values (HIGH=1, MED=2, LOW=3) are kept for SET commands
+  #   but need verification by sending SET commands and checking device behavior.
+  # ► AUTO mode forces AUTO fan (R51 manual) but status shows bit7=0!
+  #   This means bit7 = "user explicitly selected AUTO fan", NOT
+  #   "device is running fan at auto speed". In AUTO mode the device
+  #   controls fan itself without setting bit7.
+  # ► Fan speed button sequence (R51): AUTO → LOW → MED → HIGH → AUTO
+  # ---------------------------------------------------------------------------
+  fan:
+    HIGH:   0x01           # ✓ SET accepted (device beeps, status shows MANUAL)
+    MED:    0x02           # ✓ SET accepted (device beeps, status shows MANUAL)
+    LOW:    0x03           # ✓ SET accepted (device beeps, status shows MANUAL)
+    AUTO:   0x80           # ✓ verified in both SET and status
+
+  # Bit decomposition helpers for fan byte parsing (used by agent)
+  fan_bits:
+    auto_mask: 0x80        # bit 7 = auto-speed flag
+    status_mask: 0x04      # bit 2 = mode-dependent status bit
+    speed_mask: 0x03       # bits 0-1 = speed value (always 0 on MKG-300C status)
+
+  # Mode flags — bitmask (can combine).
+  # Read from RX byte 18 on MKG-300C (NOT byte 21 as xye.md says).
+  mode_flags:
+    ECO:      0x01         # ✓ ECO / Sleep (verified: SET accepted, visible in status)
+    TURBO:    0x02         # Aux heat / Turbo (untested)
+    SWING:    0x04         # ✓ Swing louver (verified: SET accepted, visible in status)
+    VENT:     0x88         # Ventilation — Fresh Star series only per R51 manual (untested)
+
+  # Operational flags — response only, bitmask.
+  # MKG-300C observations:
+  #   byte 22 = 0x04 in COOL/DRY, 0x00 in HEAT/FAN/AUTO.
+  #   BUT: PUMP flag PERSISTS after mode change (COOL→FAN→HEAT still shows 0x04
+  #   for a while). It's not an instant mode indicator — more like
+  #   "compressor/pump was recently active" or hardware state that clears slowly.
+  oper_flags:
+    PUMP:     0x04         # Water pump / compressor active (may persist across mode changes)
+    LOCKED:   0x80         # ✓ Unit locked (verified: LOCK/UNLOCK commands)
+
+  # Timer bit-encoded durations.
+  timer:
+    "15MIN":  0x01
+    "30MIN":  0x02
+    "1H":     0x04
+    "2H":     0x08
+    "4H":     0x10
+    "8H":     0x20
+    "16H":    0x40
+    INVALID:  0x80
+
+# =============================================================================
+# MQTT (sensitive settings in .env.yaml)
+# =============================================================================
+
+mqtt:
+  qos: 0
+  topics:
+    availability: homeassistant/climate/mdv_fancoil/availability
+    state: homeassistant/climate/mdv_fancoil/state
+    set: homeassistant/climate/mdv_fancoil/set
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logging:
+  level: DEBUG
